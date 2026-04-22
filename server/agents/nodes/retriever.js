@@ -1,26 +1,24 @@
-/**
- * retriever.js — Node 2
- *
- * RAG retrieval node.
- * Queries Pinecone for top-k relevant chunks based on query embedding.
- * Gracefully returns empty array if no documents indexed or Pinecone unavailable.
- */
-
 import { retrieveContext } from "../../services/ragService.js";
 
 export async function retrieverNode(state) {
-  const { query, needsRAG, logger } = state;
+  const { query, needsRAG, logger, retryTopK } = state;
 
   if (!needsRAG) {
-    logger.logStep("retriever", "Skipped — RAG not needed for this query");
+    logger.logStep("retriever", "Skipped — needsRAG=false");
     return { ...state, ragChunks: [] };
   }
 
-  logger.logStep("retriever", "Querying Pinecone for relevant chunks…");
+  const topK = retryTopK || 6;
+  logger.logStep("retriever", `Querying Pinecone (topK=${topK})…`);
 
   try {
-    const chunks = await retrieveContext(query, 5);
-    logger.logStep("retriever", `Retrieved ${chunks.length} chunks (score > 0.3)`);
+    const chunks = await retrieveContext(query, topK);
+
+    const bestScore = chunks.length > 0
+      ? `best=${chunks[0].score?.toFixed(3)}`
+      : "no results";
+
+    logger.logStep("retriever", `Retrieved ${chunks.length} chunks (${bestScore})`);
     logger.logChunks(chunks);
     logger.logToolCall("pinecone_query", query, `${chunks.length} chunks`);
 
@@ -30,4 +28,4 @@ export async function retrieverNode(state) {
     logger.logStep("retriever", `Error: ${err.message}`);
     return { ...state, ragChunks: [] };
   }
-}
+};

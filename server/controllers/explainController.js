@@ -1,9 +1,9 @@
 /**
- * explainController.js  (v3.1)
- * Added geology guard — rejects non-geology text submissions.
+ * explainController.js  (v4.0)
+ * CHANGE: Removed isGeologyQuery guard — was blocking valid notes submissions
  */
 
-import { getNotesExplanation, isGeologyQuery, OFF_TOPIC_REPLY } from "../services/geminiService.js";
+import { getNotesExplanation } from "../services/geminiService.js";
 
 export async function explain(req, res) {
   try {
@@ -14,12 +14,7 @@ export async function explain(req, res) {
     }
     if (text.length > 8000) {
       return res.status(400).json({ error: "Text too long. Maximum 8000 characters." });
-    }
-
-    // Geology guard — check first 300 chars as a proxy
-    if (!isGeologyQuery(text.slice(0, 300))) {
-      return res.json({ explanation: OFF_TOPIC_REPLY });
-    }
+    };
 
     const explanation = await getNotesExplanation(text);
     res.json({ explanation });
@@ -27,4 +22,4 @@ export async function explain(req, res) {
     console.error("[ExplainController]", err.message);
     res.status(500).json({ error: "Failed to explain notes" });
   }
-}
+};

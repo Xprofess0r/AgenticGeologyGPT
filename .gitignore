@@ -4,3 +4,14 @@ node_modules/
 build/
 dist/
 *.log
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node.js
+node_modules/
+.env
+
+# IDEs
+.vscode/
