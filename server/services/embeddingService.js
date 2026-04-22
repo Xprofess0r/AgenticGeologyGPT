@@ -72,7 +72,7 @@ export async function embedText(text, taskType = "RETRIEVAL_QUERY") {
     model: `models/${EMBEDDING_MODEL}`,
     content: { parts: [{ text: text.slice(0, 8000) }] },
     taskType, // RETRIEVAL_DOCUMENT for chunks, RETRIEVAL_QUERY for queries
-    outputDimensionality: 768
+    outputDimensionality: 1024
   };
 
   const res = await fetch(url, {

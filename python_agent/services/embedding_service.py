@@ -1,105 +1,128 @@
 """
-services/embedding_service.py (Gemini version — FINAL)
+services/embedding_service.py  (FIXED v2)
 
-✔ Uses Gemini text-embedding-004
-✔ No SDK (avoids auth + version issues)
-✔ Matches Node embeddingService.js
-✔ Supports query + document embeddings
-✔ Includes geology domain similarity
+Bugs fixed in this version:
+  1. Geology reference text EXPANDED with seismic/stratigraphic terminology.
+     The old reference scored "seismic units" at only 0.35 because
+     "seismic units / seismic facies / sequence stratigraphy" were absent.
+  2. Reference is still cached via @lru_cache — computed once per process.
+  3. Cohere v5 (ClientV2) and v4 (Client) both handled.
 """
 
 import os
-import requests
-from functools import lru_cache
 import math
-import time
+from functools import lru_cache
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set")
-
-BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-MODEL = "gemini-embedding-001"
+_client = None
 
 
-# ── Core embedding function ──────────────────────────────────
+def _get_client():
+    global _client
+    if _client is not None:
+        return _client
 
-def embed_text(text: str, task_type: str = "RETRIEVAL_QUERY") -> list[float]:
-    """
-    task_type:
-      - RETRIEVAL_QUERY (for user query)
-      - RETRIEVAL_DOCUMENT (for chunks / reference)
-    """
+    api_key = os.environ.get("COHERE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("COHERE_API_KEY not set in environment")
 
-    url = f"{BASE_URL}/models/{MODEL}:embedContent?key={GEMINI_API_KEY}"
-    payload = {
-        "model": f"models/{MODEL}",
-        "content": {
-            "parts": [{"text": text[:8000]}]
-        },
-        "taskType": task_type,
-        "outputDimensionality": 768
-    }
-    
-   # Add a simple retry for the 429 errors you are seeing
-    # FIX 429: Simple backoff retry
-    for attempt in range(3):
-        response = requests.post(url, json=payload)
-        if response.status_code == 429:
-            time.sleep(2 ** attempt) 
-            continue
-        if response.status_code != 200:
-            raise RuntimeError(f"Gemini error: {response.text[:200]}")
-        break
+    import cohere
+    try:
+        # cohere v5
+        _client = cohere.ClientV2(api_key=api_key)
+    except AttributeError:
+        # cohere v4 fallback
+        _client = cohere.Client(api_key=api_key)
+    return _client
 
-    return response.json().get("embedding", {}).get("values")
-
-    response = requests.post(url, json=payload)
-
-    if response.status_code != 200:
-        raise RuntimeError(f"Gemini embedding error: {response.text[:200]}")
-
-    data = response.json()
-
-    values = data.get("embedding", {}).get("values")
-
-    if not values:
-        raise RuntimeError("Empty embedding returned from Gemini")
-
-    return values
-
-
-# ── Query embedding ──────────────────────────────────────────
 
 def embed_query(text: str) -> list[float]:
-    return embed_text(text, "RETRIEVAL_QUERY")
+    """Embed a query string using Cohere (search_query input_type)."""
+    client = _get_client()
+    try:
+        # cohere v5
+        response = client.embed(
+            texts=[text[:8000]],
+            model="embed-english-v3.0",
+            input_type="search_query",
+            embedding_types=["float"],
+        )
+        return list(response.embeddings.float_[0])
+    except AttributeError:
+        # cohere v4
+        response = client.embed(
+            texts=[text[:8000]],
+            model="embed-english-v3.0",
+            input_type="search_query",
+        )
+        return list(response.embeddings[0])
 
 
-# ── Reference embedding (for domain filtering) ────────────────
+# ── EXPANDED geology reference ────────────────────────────────
+# Old reference lacked seismic/stratigraphic terms causing low scores
+# for queries like "seismic units", "seismic facies", "systems tracts".
 
 _GEO_REFERENCE = (
+    # Core earth sciences
     "geology earth science rocks minerals tectonics fossils stratigraphy "
-    "geomorphology paleontology GIS sedimentology petrology volcanology "
-    "seismology hydrogeology geochemistry structural geology plate tectonics "
-    "igneous metamorphic sedimentary lithosphere mantle crust earthquake fault"
+    "geomorphology paleontology sedimentology petrology volcanology "
+    "seismology hydrogeology geochemistry structural geology "
+    "igneous metamorphic sedimentary lithosphere mantle crust earthquake fault "
+    # Seismic interpretation — ADDED (was missing; caused 0.35 scores)
+    "seismic units seismic facies seismic stratigraphy seismic sequence "
+    "seismic reflection seismic section seismic horizon seismic profile "
+    "seismic interpretation seismic attributes acoustic impedance reflector "
+    "two-way travel time p-wave s-wave seismic wave velocity "
+    "sequence stratigraphy systems tract depositional sequence "
+    "unconformity onlap offlap toplap downlap clinoform truncation "
+    "transgressive regressive highstand lowstand "
+    # Subsurface / reservoir
+    "borehole core sample subsurface reservoir formation well log "
+    "porosity permeability fluid saturation caprock trap "
+    # Structural
+    "anticline syncline fold thrust fault normal fault strike-slip "
+    "plate tectonics subduction orogeny convergent divergent "
+    "batholith pluton intrusion extrusion dike sill "
+    # Rock types / mineralogy
+    "granite basalt limestone sandstone shale slate marble gneiss "
+    "quartz feldspar calcite dolomite obsidian pumice coal petroleum "
+    "crystal cleavage hardness luster fracture mohs scale "
+    # Geomorphology / surface
+    "erosion weathering deposition soil terrain canyon valley delta "
+    "glacier fluvial aeolian coastal karst geomorphic process"
 )
 
 
 @lru_cache(maxsize=1)
-def get_geology_reference_embedding() -> tuple[float, ...]:
-    vec = embed_text(_GEO_REFERENCE, "RETRIEVAL_DOCUMENT")
-    return tuple(vec)
+def get_geology_reference_embedding() -> tuple:
+    """
+    Returns geology reference embedding as a cached tuple.
+    Computed once per process start.
+    """
+    client = _get_client()
+    try:
+        # cohere v5
+        response = client.embed(
+            texts=[_GEO_REFERENCE],
+            model="embed-english-v3.0",
+            input_type="search_document",
+            embedding_types=["float"],
+        )
+        return tuple(response.embeddings.float_[0])
+    except AttributeError:
+        # cohere v4
+        response = client.embed(
+            texts=[_GEO_REFERENCE],
+            model="embed-english-v3.0",
+            input_type="search_document",
+        )
+        return tuple(response.embeddings[0])
 
-
-# ── Cosine similarity ─────────────────────────────────────────
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
+    """Fast cosine similarity without numpy."""
+    dot   = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(x * x for x in b))
-
     if mag_a == 0 or mag_b == 0:
         return 0.0
-
     return dot / (mag_a * mag_b)

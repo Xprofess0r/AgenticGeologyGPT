@@ -3,44 +3,48 @@ nodes/retriever_node.py
 
 RetrieverNode — Node 2 of the LangGraph pipeline.
 
-Queries Pinecone with the query embedding from QueryNode.
-topK=8, score_threshold=0.5, returns top 3 chunks.
-Re-embeds if QueryNode embedding is unavailable.
+Key behavior:
+  - If QueryNode did keyword-fast-path, _query_embedding is None
+    → Must embed here using Cohere (single embed call total per request)
+  - If QueryNode did Cohere embed, reuse it (zero extra calls)
+  - Graceful on Pinecone errors — empty results → web search compensates
 """
 
-from services.embedding_service import embed_query
-from services.pinecone_service import query_pinecone
+import time
 from graph_state import AgentState
 
 
 def retriever_node(state: AgentState) -> AgentState:
-    """
-    Retrieve top-k relevant chunks from Pinecone.
-    Uses cached query embedding from QueryNode when available.
-    """
+    """Retrieve top-k relevant chunks from Pinecone."""
     query = state["query"]
     print(f"[RetrieverNode] Querying Pinecone for: '{query[:60]}'")
+    t0 = time.time()
 
     try:
-        # Reuse embedding from QueryNode to avoid a second API call
         query_embedding = state.get("_query_embedding")
+
         if query_embedding is None:
-            print("[RetrieverNode] No cached embedding — re-embedding query")
+            # QueryNode used keyword fast-path — embed now for Pinecone
+            print("[RetrieverNode] Embedding query for Pinecone (keyword path)")
+            from services.embedding_service import embed_query
             query_embedding = embed_query(query)
 
+        from services.pinecone_service import query_pinecone
         chunks = query_pinecone(
             query_vector=query_embedding,
-            top_k=8,
-            score_threshold=0.5,
-            return_top=3,
+            top_k=10,
+            score_threshold=0.30,
+            return_top=5,
         )
 
-        print(f"[RetrieverNode] Retrieved {len(chunks)} qualifying chunks")
+        elapsed = round((time.time() - t0) * 1000)
+        print(f"[RetrieverNode] {len(chunks)} chunks retrieved [{elapsed}ms]")
         for i, c in enumerate(chunks):
             print(f"  Chunk {i+1}: score={c['score']}, source={c['source'][:40]}")
 
-        return {**state, "rag_results": chunks}
+        return {**state, "rag_results": chunks, "_query_embedding": query_embedding}
 
     except Exception as exc:
-        print(f"[RetrieverNode] Failed: {exc}")
+        elapsed = round((time.time() - t0) * 1000)
+        print(f"[RetrieverNode] Failed [{elapsed}ms]: {exc}")
         return {**state, "rag_results": []}

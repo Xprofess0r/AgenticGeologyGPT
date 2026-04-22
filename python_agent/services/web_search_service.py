@@ -1,65 +1,73 @@
 """
-services/web_search_service.py
+services/web_search_service.py  (FIXED)
 
-Tavily web search service.
-Prepends "geology" to query for better relevance.
-Returns top 3 results with title, url, snippet.
+Fixes applied:
+  1. Added try/except around TavilyClient import (graceful if not installed)
+  2. Safer response parsing — tavily API response structure varies by version
+  3. search() params normalized for tavily-python 0.3.x
 """
 
 import os
-from tavily import TavilyClient
-
-_client: TavilyClient | None = None
 
 
-def _get_client() -> TavilyClient:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("TAVILY_API_KEY")
-        if not api_key:
-            raise RuntimeError("TAVILY_API_KEY not set")
-        _client = TavilyClient(api_key=api_key)
-    return _client
+def _get_client():
+    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TAVILY_API_KEY not set")
+
+    try:
+        from tavily import TavilyClient
+        return TavilyClient(api_key=api_key)
+    except ImportError:
+        raise RuntimeError("tavily-python not installed. Run: pip install tavily-python")
 
 
 def search_web(query: str, max_results: int = 3) -> list[dict]:
     """
-    Run a Tavily web search and return structured results.
-
-    Args:
-        query: User query (geology prefix added internally).
-        max_results: Maximum number of results to return.
-
-    Returns:
-        List of dicts: {title, url, snippet, score}
+    Run Tavily web search and return structured results.
+    Returns empty list on any failure (non-fatal — RAG alone can answer).
     """
     try:
         client = _get_client()
-
-        # Add geology context to query for relevance
         geology_query = f"geology {query}"
 
         response = client.search(
             query=geology_query,
             search_depth="basic",
-            include_answer=False,
-            max_results=max_results + 1,  # fetch one extra, filter below
+            max_results=max_results + 1,
         )
 
-        results = response.get("results", [])
+        # Tavily returns dict with "results" key
+        if isinstance(response, dict):
+            results = response.get("results", [])
+        else:
+            # Newer tavily versions may return an object
+            results = getattr(response, "results", [])
 
-        return [
-            {
-                "title": r.get("title", "Untitled"),
-                "url": r.get("url", ""),
-                "snippet": (r.get("content") or r.get("snippet") or "")[:500],
-                "score": round(float(r.get("score", 0.7)), 4),
-            }
-            for r in results[:max_results]
-        ]
+        output = []
+        for r in results[:max_results]:
+            if isinstance(r, dict):
+                title   = r.get("title", "Untitled")
+                url     = r.get("url", "")
+                content = r.get("content") or r.get("snippet") or ""
+                score   = float(r.get("score", 0.7))
+            else:
+                title   = getattr(r, "title", "Untitled")
+                url     = getattr(r, "url", "")
+                content = getattr(r, "content", "") or getattr(r, "snippet", "")
+                score   = float(getattr(r, "score", 0.7))
 
-    except RuntimeError:
-        # No API key configured — silently skip
+            output.append({
+                "title":   title,
+                "url":     url,
+                "snippet": str(content)[:500],
+                "score":   round(score, 4),
+            })
+
+        return output
+
+    except RuntimeError as exc:
+        print(f"[WebSearchService] Skipping — {exc}")
         return []
     except Exception as exc:
         print(f"[WebSearchService] search failed: {exc}")
@@ -67,10 +75,7 @@ def search_web(query: str, max_results: int = 3) -> list[dict]:
 
 
 def is_geology_relevant(results: list[dict]) -> bool:
-    """
-    Lightweight check: do web results contain geology content?
-    Used in the decision node for evidence-based validation.
-    """
+    """Check if web results contain geology content."""
     geology_signals = {
         "rock", "mineral", "geolog", "tectonic", "seismic", "fossil",
         "sediment", "strata", "volcani", "earthquake", "magma", "crust",

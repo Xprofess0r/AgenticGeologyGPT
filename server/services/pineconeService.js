@@ -14,7 +14,7 @@ let pineconeClient = null;
 let indexInstance  = null;
 
 const INDEX_NAME = process.env.PINECONE_INDEX_NAME || "geologygpt";
-const DIMENSION  = 768; 
+const DIMENSION  = 1024; 
 
 async function getIndex() {
   if (indexInstance) return indexInstance;

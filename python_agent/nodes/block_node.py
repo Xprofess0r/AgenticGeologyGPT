@@ -1,12 +1,8 @@
 """
-nodes/block_node.py
+nodes/block_node.py  (unchanged — correct as-is)
 
-BlockNode — Node 6 of the LangGraph pipeline.
-
-Reached ONLY when DecisionNode determines the query is not geology-related
-AND no supporting evidence was found in RAG or web results.
-
-Returns the standard off-topic reply with empty sources.
+Only reached when ALL signals fail:
+  embedding low + no RAG evidence + no geology web results + no keywords
 """
 
 from graph_state import AgentState
@@ -21,14 +17,7 @@ OFF_TOPIC_REPLY = (
 
 
 def block_node(state: AgentState) -> AgentState:
-    """Set final_answer to the off-topic reply and clear sources."""
-    query = state.get("query", "")
+    query  = state.get("query", "")
     reason = state.get("_decision_reason", "non-geology query")
-
-    print(f"[BlockNode] Blocking query: '{query[:60]}' — {reason}")
-
-    return {
-        **state,
-        "final_answer": OFF_TOPIC_REPLY,
-        "sources": [],
-    }
+    print(f"[BlockNode] Blocking: '{query[:60]}' — {reason}")
+    return {**state, "final_answer": OFF_TOPIC_REPLY, "sources": []}

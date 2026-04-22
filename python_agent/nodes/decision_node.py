@@ -3,77 +3,72 @@ nodes/decision_node.py
 
 DecisionNode — Node 4 of the LangGraph pipeline.
 
-Implements the 3-step hybrid guard logic:
+4-signal hybrid guard. PASS if ANY signal is positive.
+BLOCK only if ALL fail.
 
-  Step 1: Embedding similarity (from QueryNode)
-  Step 2: Evidence-based validation (RAG + Web results)
-  Step 3: FINAL BLOCK — ONLY if ALL signals are negative:
-            - embedding_score < threshold
-            - AND no qualifying RAG results
-            - AND no qualifying web results
-
-Examples:
-  "react js"         → embedding low + no RAG + no geo web → BLOCK
-  "types of bivalves" → low embedding BUT web/RAG confirms geo → PASS
-  "earthquake causes" → high embedding → PASS immediately
+Signal priority (fast to slow):
+  1. is_geology flag from QueryNode (set True if keyword matched) — instant
+  2. Embedding score >= threshold — from Cohere
+  3. RAG evidence — from Pinecone
+  4. Web geology relevance — from Tavily
 """
 
+import time
 from services.web_search_service import is_geology_relevant
 from graph_state import AgentState
 
-EMBEDDING_THRESHOLD = 0.65
-RAG_EVIDENCE_MIN_SCORE = 0.5      # Any RAG chunk above this = evidence
-WEB_EVIDENCE_REQUIRED = True      # Use is_geology_relevant() for web check
+EMBEDDING_THRESHOLD = 0.40   # Cohere v5 scores; consistent with QueryNode
 
 
 def decision_node(state: AgentState) -> AgentState:
-    """
-    Decide whether to answer or block the query.
-    Sets is_geology=True/False in state.
-    The graph routes to AnswerNode or BlockNode based on this.
-    """
     embedding_score = state.get("embedding_score", 0.0)
-    rag_results = state.get("rag_results", [])
-    web_results = state.get("web_results", [])
+    rag_results     = state.get("rag_results",     [])
+    web_results     = state.get("web_results",     [])
+    is_geo_flag     = state.get("is_geology",      False)   # True if keyword matched in QueryNode
 
-    # ── Step 1: Embedding similarity ──────────────────────────
+    t0 = time.time()
+
+    # Signal 1: QueryNode already confirmed via keyword
+    if is_geo_flag:
+        # If keyword already confirmed, pass immediately — no need to re-check
+        top_rag = max((r.get("score", 0) for r in rag_results), default=0)
+        reason  = f"PASS — keyword_or_embedding confirmed in QueryNode (emb={embedding_score:.3f}, rag_top={top_rag:.2f})"
+        elapsed = round((time.time() - t0) * 1000)
+        print(f"[DecisionNode] {reason} [{elapsed}ms]")
+        return {**state, "is_geology": True, "_decision_reason": reason}
+
+    # Signal 2: Embedding threshold
     embedding_ok = embedding_score >= EMBEDDING_THRESHOLD
 
-    # ── Step 2: Evidence-based validation ─────────────────────
-    rag_has_evidence = any(
-        r.get("score", 0) >= RAG_EVIDENCE_MIN_SCORE for r in rag_results
-    )
+    # Signal 3: RAG evidence
+    rag_has_evidence = any(r.get("score", 0) >= 0.30 for r in rag_results)
+
+    # Signal 4: Web geology content
     web_has_geology = len(web_results) > 0 and is_geology_relevant(web_results)
 
-    # ── Step 3: Final decision — only block if ALL fail ────────
     is_geology = embedding_ok or rag_has_evidence or web_has_geology
 
-    # Detailed reasoning for logs
-    reason_parts = []
+    signals = []
     if embedding_ok:
-        reason_parts.append(f"embedding={embedding_score:.3f}≥{EMBEDDING_THRESHOLD}")
+        signals.append(f"embedding={embedding_score:.3f}≥{EMBEDDING_THRESHOLD}")
     if rag_has_evidence:
-        top_score = max((r["score"] for r in rag_results), default=0)
-        reason_parts.append(f"RAG_evidence(top={top_score:.2f})")
+        top = max((r["score"] for r in rag_results), default=0)
+        signals.append(f"RAG_evidence(top={top:.2f})")
     if web_has_geology:
-        reason_parts.append(f"web_geology({len(web_results)} results)")
+        signals.append(f"web_geology({len(web_results)} results)")
 
     if is_geology:
-        reason = "PASS — " + ", ".join(reason_parts)
+        reason = "PASS — " + ", ".join(signals)
     else:
         reason = (
             f"BLOCK — embedding={embedding_score:.3f}<{EMBEDDING_THRESHOLD}, "
-            f"no_RAG_evidence, no_geo_web"
+            f"no_RAG, no_geo_web, no_keywords"
         )
 
-    print(f"[DecisionNode] {reason}")
-
+    elapsed = round((time.time() - t0) * 1000)
+    print(f"[DecisionNode] {reason} [{elapsed}ms]")
     return {**state, "is_geology": is_geology, "_decision_reason": reason}
 
 
 def route_after_decision(state: AgentState) -> str:
-    """
-    LangGraph conditional edge function.
-    Returns node name to route to: 'answer_node' or 'block_node'.
-    """
     return "answer_node" if state.get("is_geology", False) else "block_node"

@@ -1,1 +1,1 @@
-# services package
+# GeologyGPT Python Agent Services

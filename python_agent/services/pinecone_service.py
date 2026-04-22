@@ -1,15 +1,17 @@
 """
-services/pinecone_service.py
+services/pinecone_service.py  (FIXED)
 
-Pinecone retrieval service.
-Queries the same index used by Node.js ingest pipeline.
-topK=8, returns top 3 chunks with score > 0.5.
+Fixes applied:
+  1. result.get("matches", []) → result.matches  (Pinecone v3 returns object, not dict)
+  2. m["metadata"] → m.metadata  (Match object attribute access)
+  3. m["score"] → m.score
+  4. Added safe attribute access with getattr fallbacks
+  5. Package: requires 'pinecone' not 'pinecone-client'
 """
 
 import os
-from pinecone import Pinecone
 
-_pc: Pinecone | None = None
+_pc    = None
 _index = None
 
 
@@ -18,14 +20,16 @@ def _get_index():
     if _index is not None:
         return _index
 
-    api_key = os.environ.get("PINECONE_API_KEY")
-    index_name = os.environ.get("PINECONE_INDEX_NAME", "geologygpt")
+    api_key    = os.environ.get("PINECONE_API_KEY", "").strip()
+    index_name = os.environ.get("PINECONE_INDEX_NAME", "geologygpt").strip()
 
     if not api_key:
-        raise RuntimeError("PINECONE_API_KEY not set")
+        raise RuntimeError("PINECONE_API_KEY not set in environment")
 
-    _pc = Pinecone(api_key=api_key)
+    from pinecone import Pinecone
+    _pc    = Pinecone(api_key=api_key)
     _index = _pc.Index(index_name)
+    print(f"[PineconeService] Connected to index '{index_name}'")
     return _index
 
 
@@ -38,42 +42,46 @@ def query_pinecone(
     """
     Query Pinecone and return filtered, ranked chunks.
 
-    Args:
-        query_vector: Query embedding vector.
-        top_k: Number of candidates to retrieve from Pinecone.
-        score_threshold: Minimum cosine score to keep.
-        return_top: Number of final chunks to return.
-
     Returns:
         List of dicts: {text, source, chunk_index, score}
     """
     try:
-        index = _get_index()
+        index  = _get_index()
         result = index.query(
             vector=query_vector,
             top_k=top_k,
             include_metadata=True,
         )
 
-        matches = result.get("matches", [])
+        # FIXED: Pinecone v3 returns QueryResponse object
+        # result.matches is a list of ScoredVector objects (NOT a dict)
+        raw_matches = result.matches  # ← was: result.get("matches", [])
 
-        # Filter by score threshold
-        filtered = [
-            {
-                "text": m["metadata"].get("text", ""),
-                "source": m["metadata"].get("source", "unknown"),
-                "chunk_index": int(m["metadata"].get("chunkIndex", 0)),
-                "score": round(float(m["score"]), 4),
-            }
-            for m in matches
-            if m.get("score", 0) >= score_threshold
-        ]
+        filtered = []
+        for m in raw_matches:
+            # FIXED: attribute access, not dict key access
+            score    = float(getattr(m, "score", 0))
+            metadata = getattr(m, "metadata", {}) or {}
 
-        # Sort descending by score (Pinecone already does this, but be safe)
+            if score < score_threshold:
+                continue
+
+            filtered.append({
+                "text":        metadata.get("text", ""),
+                "source":      metadata.get("source", "unknown"),
+                "chunk_index": int(metadata.get("chunkIndex", 0)),
+                "score":       round(score, 4),
+            })
+
+        # Sort descending by score
         filtered.sort(key=lambda x: x["score"], reverse=True)
+        results = filtered[:return_top]
 
-        return filtered[:return_top]
+        print(f"[PineconeService] {len(results)} chunks above threshold={score_threshold}")
+        return results
 
+    except RuntimeError:
+        raise
     except Exception as exc:
         print(f"[PineconeService] query failed: {exc}")
         return []

@@ -1,1 +1,1 @@
-# nodes package
+# GeologyGPT Python Agent Nodes

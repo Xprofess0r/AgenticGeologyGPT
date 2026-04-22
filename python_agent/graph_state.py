@@ -1,8 +1,9 @@
 """
-graph_state.py
+graph_state.py  (FIXED)
 
-Shared state object for the LangGraph agent pipeline.
-All nodes read from and write to this typed dictionary.
+Fixes applied:
+  1. Added missing field: _decision_reason (was referenced but not declared)
+  2. Made all fields properly optional with total=False
 """
 
 from typing import Any
@@ -10,22 +11,22 @@ from typing_extensions import TypedDict
 
 
 class AgentState(TypedDict, total=False):
-    # ── Core inputs ──────────────────────────────────────────
-    query: str                      # User's question
-    history: list[dict]             # Conversation history [{role, content}]
+    # ── Core inputs ───────────────────────────────────────────
+    query:   str
+    history: list[dict]
 
     # ── Guard / classification ────────────────────────────────
-    embedding_score: float          # Cosine similarity vs geology reference
-    is_geology: bool                # True = proceed to answer; False = block
+    embedding_score: float
+    is_geology:      bool
 
     # ── Retrieval results ─────────────────────────────────────
-    rag_results: list[dict]         # Pinecone chunks [{text, source, score, ...}]
-    web_results: list[dict]         # Tavily results [{title, url, snippet, score}]
+    rag_results: list[dict]
+    web_results: list[dict]
 
-    # ── Output ────────────────────────────────────────────────
-    final_answer: str               # Generated answer or block message
-    sources: list[dict]             # Structured sources for frontend
+    # ── Output ───────────────────────────────────────────────
+    final_answer: str
+    sources:      list[dict]
 
     # ── Internal / debug ─────────────────────────────────────
-    _query_embedding: list[float] | None   # Cached embedding from QueryNode
-    _decision_reason: str                  # Human-readable decision log
+    _query_embedding: list[float] | None
+    _decision_reason: str              # ← was missing from original TypedDict
