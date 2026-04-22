@@ -1,36 +1,30 @@
 /**
- * geminiService.js  (v4.0 — Fixed)
+ * geminiService.js  (v5)
  *
  * CHANGES:
- *  1. REMOVED isGeologyQuery() export — no longer used anywhere (gate removed)
- *  2. REMOVED OFF_TOPIC_REPLY export — no longer needed
- *  3. DR_TERRA_SYSTEM softened: no longer has "STRICT RULE: only geology"
- *     because it was causing Gemini to refuse borderline valid questions
- *     (e.g. "what is a DEM?" or "explain Python scripting for GIS")
- *  4. callGemini unchanged — working fine
- *  5. Rate limiter unchanged
+ *  - Model default: gemini-2.5-flash (matches SpaceGPT)
+ *  - DR_TERRA_SYSTEM: removed hard "STRICT RULE" blocking — was causing
+ *    Gemini to refuse borderline geology questions like "what is a DEM?"
+ *  - NOTES_EXPLAINER_SYSTEM: same softening
+ *  - callGemini: unchanged — already working
  */
 
 import dotenv from "dotenv";
 dotenv.config();
 import { geminiLimiter } from "../utils/rateLimiter.js";
 
-const MODEL    = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const MODEL    = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const MAX_RETRIES = 2;
 const BASE_DELAY  = 3000;
 
-// ── Core REST call ────────────────────────────────────────────
 export async function callGemini(prompt, systemInstruction = "", options = {}, attempt = 0) {
-  const {
-    maxOutputTokens = 1800,
-    temperature     = 0.45,
-  } = options;
+  const { maxOutputTokens = 1800, temperature = 0.6 } = options;
 
   const url  = `${BASE_URL}/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
   const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    contents:         [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: { maxOutputTokens, temperature },
   };
 
@@ -60,56 +54,47 @@ export async function callGemini(prompt, systemInstruction = "", options = {}, a
     return text;
 
   } catch (err) {
-    const isRetryable =
+    const retryable =
       err?.status === 429 || err?.status === 503 || err?.status === 500 ||
       err?.message?.includes("overloaded") || err?.message?.includes("quota") ||
       err?.message?.includes("RESOURCE_EXHAUSTED");
 
-    if (isRetryable && attempt < MAX_RETRIES) {
+    if (retryable && attempt < MAX_RETRIES) {
       const delay = BASE_DELAY * Math.pow(2, attempt);
-      console.warn(`[Gemini] Retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms — ${err.message}`);
+      console.warn(`[Gemini] Retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms`);
       await new Promise((r) => setTimeout(r, delay));
       return callGemini(prompt, systemInstruction, options, attempt + 1);
     }
-
-    console.error(`[Gemini] Failed after ${attempt} retries:`, err.message);
     throw err;
   }
 }
 
 // ── System prompts ────────────────────────────────────────────
 
-// Softened: no longer hard-refuses non-geology, just redirects politely
-export const DR_TERRA_SYSTEM = `You are Dr. Terra, an expert geology professor and field geologist with 25 years of experience covering petrology, mineralogy, structural geology, tectonics, stratigraphy, sedimentology, geomorphology, geophysics, hydrogeology, paleontology, geochemistry, volcanology, seismology, field mapping, and geological data analysis (GIS, remote sensing).
+export const DR_TERRA_SYSTEM = `You are Dr. Terra, an expert geology professor and field geologist with 25 years of experience.
 
-Your primary focus is geology and earth sciences. For questions clearly outside these domains, gently note your specialty and still try to help if there is any earth-science angle.
+You specialise in: petrology, mineralogy, structural geology, tectonics, stratigraphy, sedimentology, geomorphology, geophysics, hydrogeology, paleontology, geochemistry, volcanology, seismology, field mapping, rock/mineral identification, GIS for geology, borehole analysis, and seismic interpretation.
 
 When answering:
 - Be precise and use correct terminology (define jargon on first use)
-- Cite [Source N] for uploaded document context, [Web N] for web results
-- Use analogies to clarify complex concepts
+- When CONTEXT is provided, cite [Source N] for documents, [Web N] for web results inline
+- NEVER fabricate mineral properties, rock names, measurements, or citations
+- When uncertain, say so explicitly — do not guess
+- Use markdown headers for structured answers
 - Be enthusiastic and encouraging for students
-- Add practical fieldwork tips where relevant
-- Structure long answers with markdown headers
-
-ACCURACY RULES:
-- Never fabricate mineral properties, rock names, or geological data
-- When uncertain, say so explicitly
-- Prefer information from provided context over general knowledge
-- Distinguish between established science and active research debates`;
+- Add practical fieldwork tips where relevant`;
 
 export const NOTES_EXPLAINER_SYSTEM = `You are Dr. Terra, a geology expert and science communicator.
-Focus on geology and earth science content, but process any scientific text helpfully.
 
-For content provided:
-1. Summarize key concepts clearly
+For the provided geology notes or text:
+1. Summarise key concepts clearly
 2. Explain technical terms in plain language
-3. Identify the most important takeaways
-4. Add a "Why this matters" section
-5. Suggest follow-up topics to explore
+3. Identify the most important takeaways (3-5 points)
+4. Add a "Why this matters" section with real-world context
+5. Suggest 3 follow-up topics worth exploring
 Format with clear markdown sections.`;
 
-// ── Legacy helpers ────────────────────────────────────────────
+// ── Legacy helpers (used by Node.js fallback graph) ──────────
 
 export async function getChatCompletion(messages, ragContext = null) {
   try {
@@ -139,6 +124,6 @@ export async function getNotesExplanation(text) {
       { maxOutputTokens: 2000 }
     );
   } catch {
-    return "⚠️ Could not process notes right now. Please try again shortly.";
+    return "⚠️ Could not process notes. Please try again.";
   }
-};
+}

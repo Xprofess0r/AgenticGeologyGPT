@@ -1,73 +1,61 @@
 """
-nodes/decision_node.py
+nodes/decision_node.py  (v5 — SpaceGPT-aligned)
 
-DecisionNode — Node 4 of the LangGraph pipeline.
+SpaceGPT uses should_continue() which reads is_out_of_scope from plan_node.
+We trust QueryNode's Gemini planner verdict. The decision node just forwards it.
 
-4-signal hybrid guard. PASS if ANY signal is positive.
-BLOCK only if ALL fail.
+If QueryNode's Gemini call failed and fell back to keywords:
+  - We also check RAG evidence and web results as secondary signals
+  - This ensures robustness even when the planner call fails
 
-Signal priority (fast to slow):
-  1. is_geology flag from QueryNode (set True if keyword matched) — instant
-  2. Embedding score >= threshold — from Cohere
-  3. RAG evidence — from Pinecone
-  4. Web geology relevance — from Tavily
+BLOCK only if ALL of these fail:
+  1. QueryNode said is_geology=False
+  2. No RAG evidence (score < 0.30)
+  3. No geology-relevant web results
 """
 
 import time
 from services.web_search_service import is_geology_relevant
 from graph_state import AgentState
 
-EMBEDDING_THRESHOLD = 0.40   # Cohere v5 scores; consistent with QueryNode
-
 
 def decision_node(state: AgentState) -> AgentState:
-    embedding_score = state.get("embedding_score", 0.0)
-    rag_results     = state.get("rag_results",     [])
-    web_results     = state.get("web_results",     [])
-    is_geo_flag     = state.get("is_geology",      False)   # True if keyword matched in QueryNode
+    is_geology  = state.get("is_geology",       False)
+    rag_results = state.get("rag_results",       [])
+    web_results = state.get("web_results",       [])
+    emb_score   = state.get("embedding_score",   0.0)
 
     t0 = time.time()
 
-    # Signal 1: QueryNode already confirmed via keyword
-    if is_geo_flag:
-        # If keyword already confirmed, pass immediately — no need to re-check
+    # If planner already confirmed geology — trust it
+    if is_geology:
         top_rag = max((r.get("score", 0) for r in rag_results), default=0)
-        reason  = f"PASS — keyword_or_embedding confirmed in QueryNode (emb={embedding_score:.3f}, rag_top={top_rag:.2f})"
+        reason  = f"PASS — planner confirmed geology (emb={emb_score:.2f}, rag_top={top_rag:.3f})"
         elapsed = round((time.time() - t0) * 1000)
         print(f"[DecisionNode] {reason} [{elapsed}ms]")
         return {**state, "is_geology": True, "_decision_reason": reason}
 
-    # Signal 2: Embedding threshold
-    embedding_ok = embedding_score >= EMBEDDING_THRESHOLD
-
-    # Signal 3: RAG evidence
+    # Planner said NOT geology — check secondary evidence before blocking
     rag_has_evidence = any(r.get("score", 0) >= 0.30 for r in rag_results)
+    web_has_geology  = is_geology_relevant(web_results)
 
-    # Signal 4: Web geology content
-    web_has_geology = len(web_results) > 0 and is_geology_relevant(web_results)
+    # Override if evidence found
+    if rag_has_evidence or web_has_geology:
+        signals = []
+        if rag_has_evidence:
+            top = max((r["score"] for r in rag_results), default=0)
+            signals.append(f"RAG_evidence(top={top:.3f})")
+        if web_has_geology:
+            signals.append(f"web_geology_detected")
+        reason  = "PASS (override) — " + ", ".join(signals)
+        elapsed = round((time.time() - t0) * 1000)
+        print(f"[DecisionNode] {reason} [{elapsed}ms]")
+        return {**state, "is_geology": True, "_decision_reason": reason}
 
-    is_geology = embedding_ok or rag_has_evidence or web_has_geology
-
-    signals = []
-    if embedding_ok:
-        signals.append(f"embedding={embedding_score:.3f}≥{EMBEDDING_THRESHOLD}")
-    if rag_has_evidence:
-        top = max((r["score"] for r in rag_results), default=0)
-        signals.append(f"RAG_evidence(top={top:.2f})")
-    if web_has_geology:
-        signals.append(f"web_geology({len(web_results)} results)")
-
-    if is_geology:
-        reason = "PASS — " + ", ".join(signals)
-    else:
-        reason = (
-            f"BLOCK — embedding={embedding_score:.3f}<{EMBEDDING_THRESHOLD}, "
-            f"no_RAG, no_geo_web, no_keywords"
-        )
-
+    reason  = f"BLOCK — planner: not geology, no RAG evidence, no geo web results"
     elapsed = round((time.time() - t0) * 1000)
     print(f"[DecisionNode] {reason} [{elapsed}ms]")
-    return {**state, "is_geology": is_geology, "_decision_reason": reason}
+    return {**state, "is_geology": False, "_decision_reason": reason}
 
 
 def route_after_decision(state: AgentState) -> str:

@@ -1,7 +1,12 @@
 """
-nodes/answer_node.py
+nodes/answer_node.py  (v5 — SpaceGPT-aligned)
 
-AnswerNode — Node 5. Calls sync Gemini, builds sources list.
+SpaceGPT pipeline:
+  1. critique_node: filters & consolidates retrieved_docs + search_results
+  2. writer_node:   generates final answer from filtered_context
+
+We implement both steps here (one Gemini call = critique+write combined)
+to save quota. For higher quality, they can be split.
 """
 
 import time
@@ -15,7 +20,7 @@ def answer_node(state: AgentState) -> AgentState:
     web_results = state.get("web_results", [])
     history     = state.get("history",     [])
 
-    print(f"[AnswerNode] Generating (rag={len(rag_results)}, web={len(web_results)})")
+    print(f"[AnswerNode] Generating answer (rag={len(rag_results)}, web={len(web_results)})")
     t0 = time.time()
 
     try:
@@ -34,6 +39,7 @@ def answer_node(state: AgentState) -> AgentState:
 
     elapsed = round((time.time() - t0) * 1000)
 
+    # Build sources
     doc_sources = [
         {
             "type":        "document",

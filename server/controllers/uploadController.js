@@ -1,7 +1,9 @@
 /**
- * uploadController.js
- * POST /api/upload
- * Accepts a PDF, runs full RAG ingestion pipeline.
+ * uploadController.js  (v5)
+ *
+ * Accepts PDF upload, chunks it in Node.js,
+ * sends chunks to Python agent /ingest for Gemini embedding.
+ * Falls back to Node.js embedding if Python agent is down.
  */
 
 import { ingestPDF } from "../services/ragService.js";
@@ -23,10 +25,10 @@ export async function uploadPDF(req, res) {
     const result = await ingestPDF(buffer, originalname);
 
     res.json({
-      success: true,
-      message: `Successfully processed "${originalname}"`,
+      success:       true,
+      message:       `Successfully indexed "${originalname}"`,
       chunksIndexed: result.chunksCount,
-      source: result.source,
+      source:        result.source,
     });
   } catch (err) {
     console.error("[UploadController]", err.message);

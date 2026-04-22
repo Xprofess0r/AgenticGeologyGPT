@@ -1,65 +1,67 @@
 /**
- * controllers/chatController.js  (v4 — Python Agent Integration)
+ * chatController.js  (v5)
  *
- * Routes all chat queries to the Python LangGraph agent via HTTP.
- * Falls back to the original Node.js graph if Python agent is unreachable.
- *
- * POST /api/chat
- *   Body: { messages: [{role, content}], sessionId?: string }
- *   Headers: X-Session-ID (optional override)
- *
- * Response shape is backward-compatible with the React frontend.
+ * Routes to Python LangGraph agent first, Node.js graph as fallback.
+ * Maps Python agent response shape to frontend-expected shape.
  */
 
 import { callPythonAgent, isPythonAgentHealthy } from "../services/pythonAgentService.js";
 import { runAgentGraph, clearSession }           from "../agents/graph.js";
 
-// ── Fallback flag — set to false to disable Node.js fallback ──
 const ENABLE_NODEJS_FALLBACK = process.env.ENABLE_NODEJS_FALLBACK !== "false";
 
 export async function chat(req, res) {
   try {
     const { messages, sessionId: bodySessionId } = req.body;
-    const sessionId =
-      bodySessionId || req.headers["x-session-id"] || "default";
+    const sessionId = bodySessionId || req.headers["x-session-id"] || "default";
 
-    // ── Validation ────────────────────────────────────────────
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array is required" });
     }
 
     const query = messages[messages.length - 1]?.content?.trim() || "";
-    if (!query) {
-      return res.status(400).json({ error: "Last message content is empty" });
-    }
+    if (!query) return res.status(400).json({ error: "Last message content is empty" });
 
-    // ── Try Python agent first ────────────────────────────────
+    // ── Try Python agent ──────────────────────────────────────
     let result = null;
 
     try {
-      const agentResult = await callPythonAgent(query, messages);
+      const py = await callPythonAgent(query, messages);
+
+      // Build step trace for frontend AgentSteps component
+      const steps = [
+        { node: "query_node",      detail: `rag_query="${(py.rag_query||"").slice(0,60)}"` },
+        { node: "retriever_node",  detail: `rag_chunks=${py.rag_count}, embed=gemini-embedding-001` },
+        { node: "web_search_node", detail: `web_results=${py.web_count}` },
+        { node: "decision_node",   detail: py.decision_reason || "n/a" },
+        {
+          node:   py.is_geology ? "answer_node" : "block_node",
+          detail: py.is_geology ? `${py.answer?.length || 0} chars` : "blocked",
+        },
+      ];
 
       result = {
-        reply:      agentResult.answer,
-        sources:    agentResult.sources        || [],
-        confidence: agentResult.is_geology ? 0.8 : 0,
-        route:      agentResult.is_geology ? "python-agent" : "rejected",
+        reply:      py.answer,
+        sources:    py.sources         || [],
+        confidence: py.is_geology ? Math.min(0.95, 0.60 + (py.rag_count || 0) * 0.07) : 0,
+        route:      py.is_geology
+          ? (py.rag_count > 0 && py.web_count > 0 ? "parallel"
+            : py.rag_count > 0 ? "rag"
+            : py.web_count > 0 ? "web"
+            : "direct")
+          : "rejected",
         evaluation: {
-          embeddingScore: agentResult.embedding_score,
-          isGeology:      agentResult.is_geology,
-          ragCount:       agentResult.rag_count,
-          webCount:       agentResult.web_count,
-          decisionReason: agentResult.decision_reason,
-          latencyMs:      agentResult.latency_ms,
-          method:         "python-langgraph",
+          embeddingScore: py.embedding_score,
+          isGeology:      py.is_geology,
+          ragCount:       py.rag_count,
+          webCount:       py.web_count,
+          decisionReason: py.decision_reason,
+          ragQuery:       py.rag_query,
+          searchQuery:    py.search_query,
+          latencyMs:      py.latency_ms,
+          method:         "python-langgraph-v5",
         },
-        steps: [
-          { node: "query_node",      detail: `embedding_score=${(agentResult.embedding_score || 0).toFixed(3)}` },
-          { node: "retriever_node",  detail: `rag_chunks=${agentResult.rag_count}` },
-          { node: "web_search_node", detail: `web_results=${agentResult.web_count}` },
-          { node: "decision_node",   detail: agentResult.decision_reason },
-          { node: agentResult.is_geology ? "answer_node" : "block_node", detail: "done" },
-        ],
+        steps,
         runId: `py-${Date.now().toString(36)}`,
       };
 
@@ -69,22 +71,21 @@ export async function chat(req, res) {
       if (!ENABLE_NODEJS_FALLBACK) {
         return res.status(503).json({
           error:   "Agent service unavailable",
-          message: "Python agent is down and fallback is disabled",
+          message: "Python agent is down. Start it with: cd python_agent && uvicorn main:app",
         });
       }
 
-      // ── Fallback to Node.js graph ─────────────────────────
       console.log("[ChatController] Falling back to Node.js graph");
-      const fallback = await runAgentGraph(query, messages, sessionId);
+      const fb = await runAgentGraph(query, messages, sessionId);
 
       result = {
-        reply:      fallback.answer,
-        sources:    fallback.sources    || [],
-        confidence: fallback.confidence || 0,
-        route:      fallback.route      || "nodejs-fallback",
-        evaluation: fallback.evaluation || null,
-        steps:      fallback.steps      || [],
-        runId:      fallback.runId,
+        reply:      fb.answer,
+        sources:    fb.sources    || [],
+        confidence: fb.confidence || 0,
+        route:      (fb.route || "nodejs-fallback"),
+        evaluation: fb.evaluation || null,
+        steps:      fb.steps      || [],
+        runId:      fb.runId,
         _fallback:  true,
       };
     }
@@ -108,5 +109,7 @@ export async function agentStatus(req, res) {
   res.json({
     pythonAgent:     healthy ? "online" : "offline",
     fallbackEnabled: ENABLE_NODEJS_FALLBACK,
+    model:           process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    embedModel:      "gemini-embedding-001 (1024-dim)",
   });
 }

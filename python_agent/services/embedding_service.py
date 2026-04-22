@@ -1,125 +1,106 @@
 """
-services/embedding_service.py  (FIXED v2)
+services/embedding_service.py  (v5 — Gemini embeddings, Cohere dropped)
 
-Bugs fixed in this version:
-  1. Geology reference text EXPANDED with seismic/stratigraphic terminology.
-     The old reference scored "seismic units" at only 0.35 because
-     "seismic units / seismic facies / sequence stratigraphy" were absent.
-  2. Reference is still cached via @lru_cache — computed once per process.
-  3. Cohere v5 (ClientV2) and v4 (Client) both handled.
+WHY SWITCH FROM COHERE TO GEMINI:
+  - Cohere free tier: 100 calls/min → quota exhausts immediately on PDF upload
+  - gemini-embedding-001: 1500 RPM free tier, same API key as chat
+  - No new API key, no new bill, no new SDK — just a different endpoint
+  - Dimension: 1024 (matching your existing Pinecone index DIMENSION=1024)
+
+SpaceGPT uses: GoogleGenAIEmbedding via LlamaIndex (models/embedding-001)
+We use:        Direct REST to gemini-embedding-001 (same underlying model)
+               outputDimensionality: 1024 matches existing Pinecone index
 """
 
 import os
+import time
+import httpx
 import math
-from functools import lru_cache
 
-_client = None
+BASE_URL       = "https://generativelanguage.googleapis.com/v1beta"
+EMBED_MODEL    = "gemini-embedding-001"   # 1024-dim, matches your Pinecone index
+OUTPUT_DIM     = 1024                      # Must match PINECONE index dimension
+
+# Simple rate limiter — Gemini embedding: 1500 RPM free tier
+_last_embed_time: float = 0.0
+_MIN_EMBED_INTERVAL    = 0.05  # 50ms = max 20 req/s, well under 1500 RPM
 
 
-def _get_client():
-    global _client
-    if _client is not None:
-        return _client
-
-    api_key = os.environ.get("COHERE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("COHERE_API_KEY not set in environment")
-
-    import cohere
-    try:
-        # cohere v5
-        _client = cohere.ClientV2(api_key=api_key)
-    except AttributeError:
-        # cohere v4 fallback
-        _client = cohere.Client(api_key=api_key)
-    return _client
+def _rate_limit():
+    global _last_embed_time
+    elapsed = time.time() - _last_embed_time
+    if elapsed < _MIN_EMBED_INTERVAL:
+        time.sleep(_MIN_EMBED_INTERVAL - elapsed)
+    _last_embed_time = time.time()
 
 
 def embed_query(text: str) -> list[float]:
-    """Embed a query string using Cohere (search_query input_type)."""
-    client = _get_client()
-    try:
-        # cohere v5
-        response = client.embed(
-            texts=[text[:8000]],
-            model="embed-english-v3.0",
-            input_type="search_query",
-            embedding_types=["float"],
-        )
-        return list(response.embeddings.float_[0])
-    except AttributeError:
-        # cohere v4
-        response = client.embed(
-            texts=[text[:8000]],
-            model="embed-english-v3.0",
-            input_type="search_query",
-        )
-        return list(response.embeddings[0])
+    """Embed a single query string. task_type=RETRIEVAL_QUERY."""
+    return _embed(text, "RETRIEVAL_QUERY")
 
 
-# ── EXPANDED geology reference ────────────────────────────────
-# Old reference lacked seismic/stratigraphic terms causing low scores
-# for queries like "seismic units", "seismic facies", "systems tracts".
-
-_GEO_REFERENCE = (
-    # Core earth sciences
-    "geology earth science rocks minerals tectonics fossils stratigraphy "
-    "geomorphology paleontology sedimentology petrology volcanology "
-    "seismology hydrogeology geochemistry structural geology "
-    "igneous metamorphic sedimentary lithosphere mantle crust earthquake fault "
-    # Seismic interpretation — ADDED (was missing; caused 0.35 scores)
-    "seismic units seismic facies seismic stratigraphy seismic sequence "
-    "seismic reflection seismic section seismic horizon seismic profile "
-    "seismic interpretation seismic attributes acoustic impedance reflector "
-    "two-way travel time p-wave s-wave seismic wave velocity "
-    "sequence stratigraphy systems tract depositional sequence "
-    "unconformity onlap offlap toplap downlap clinoform truncation "
-    "transgressive regressive highstand lowstand "
-    # Subsurface / reservoir
-    "borehole core sample subsurface reservoir formation well log "
-    "porosity permeability fluid saturation caprock trap "
-    # Structural
-    "anticline syncline fold thrust fault normal fault strike-slip "
-    "plate tectonics subduction orogeny convergent divergent "
-    "batholith pluton intrusion extrusion dike sill "
-    # Rock types / mineralogy
-    "granite basalt limestone sandstone shale slate marble gneiss "
-    "quartz feldspar calcite dolomite obsidian pumice coal petroleum "
-    "crystal cleavage hardness luster fracture mohs scale "
-    # Geomorphology / surface
-    "erosion weathering deposition soil terrain canyon valley delta "
-    "glacier fluvial aeolian coastal karst geomorphic process"
-)
+def embed_document(text: str) -> list[float]:
+    """Embed a single document chunk. task_type=RETRIEVAL_DOCUMENT."""
+    return _embed(text, "RETRIEVAL_DOCUMENT")
 
 
-@lru_cache(maxsize=1)
-def get_geology_reference_embedding() -> tuple:
-    """
-    Returns geology reference embedding as a cached tuple.
-    Computed once per process start.
-    """
-    client = _get_client()
-    try:
-        # cohere v5
-        response = client.embed(
-            texts=[_GEO_REFERENCE],
-            model="embed-english-v3.0",
-            input_type="search_document",
-            embedding_types=["float"],
-        )
-        return tuple(response.embeddings.float_[0])
-    except AttributeError:
-        # cohere v4
-        response = client.embed(
-            texts=[_GEO_REFERENCE],
-            model="embed-english-v3.0",
-            input_type="search_document",
-        )
-        return tuple(response.embeddings[0])
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a list of document chunks with progress logging."""
+    embeddings = []
+    for i, text in enumerate(texts):
+        if i > 0 and i % 10 == 0:
+            print(f"[EmbedService] Progress: {i}/{len(texts)} chunks embedded")
+            time.sleep(1.0)  # 1s pause every 10 to be safe
+        embeddings.append(embed_document(text))
+    return embeddings
 
 
+def _embed(text: str, task_type: str) -> list[float]:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    _rate_limit()
+
+    url = f"{BASE_URL}/models/{EMBED_MODEL}:embedContent?key={api_key}"
+    payload = {
+        "model":   f"models/{EMBED_MODEL}",
+        "content": {"parts": [{"text": text[:8000]}]},
+        "taskType": task_type,
+        "outputDimensionality": OUTPUT_DIM,
+    }
+
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(url, json=payload)
+
+            if resp.status_code == 429:
+                wait = 5 * (2 ** attempt)
+                print(f"[EmbedService] Rate limited — waiting {wait}s")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            data   = resp.json()
+            values = data.get("embedding", {}).get("values", [])
+            if not values:
+                raise ValueError("Empty embedding returned")
+            return values
+
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            print(f"[EmbedService] Network error attempt {attempt+1}: {exc}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(3)
+                continue
+            raise
+
+    raise RuntimeError(f"Embedding failed after {MAX_RETRIES} attempts")
+
+
+# ── Cosine similarity (for reference / debugging) ─────────────
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Fast cosine similarity without numpy."""
     dot   = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(x * x for x in b))

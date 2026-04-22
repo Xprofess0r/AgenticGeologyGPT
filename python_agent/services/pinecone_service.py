@@ -1,12 +1,8 @@
 """
-services/pinecone_service.py  (FIXED)
+services/pinecone_service.py  (v5)
 
-Fixes applied:
-  1. result.get("matches", []) → result.matches  (Pinecone v3 returns object, not dict)
-  2. m["metadata"] → m.metadata  (Match object attribute access)
-  3. m["score"] → m.score
-  4. Added safe attribute access with getattr fallbacks
-  5. Package: requires 'pinecone' not 'pinecone-client'
+No logic changes needed — pinecone v3 attribute access is already correct.
+Dimension aligned to 1024 (gemini-embedding-001 default).
 """
 
 import os
@@ -24,26 +20,57 @@ def _get_index():
     index_name = os.environ.get("PINECONE_INDEX_NAME", "geologygpt").strip()
 
     if not api_key:
-        raise RuntimeError("PINECONE_API_KEY not set in environment")
+        raise RuntimeError("PINECONE_API_KEY not set")
 
     from pinecone import Pinecone
     _pc    = Pinecone(api_key=api_key)
+
+    # Check if index exists
+    existing = _pc.list_indexes()
+    names = [idx.name for idx in existing]
+
+    if index_name not in names:
+        print(f"[PineconeService] Creating index '{index_name}' dim=1024 ...")
+        from pinecone import ServerlessSpec
+        _pc.create_index(
+            name=index_name,
+            dimension=1024,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+        # Wait for ready
+        import time
+        for i in range(20):
+            time.sleep(3)
+            desc = _pc.describe_index(index_name)
+            if getattr(desc.status, "ready", False):
+                print(f"[PineconeService] Index '{index_name}' ready.")
+                break
+            print(f"[PineconeService] Waiting for index... ({i+1}/20)")
+
     _index = _pc.Index(index_name)
     print(f"[PineconeService] Connected to index '{index_name}'")
     return _index
 
 
+def upsert_vectors(vectors: list[dict]) -> None:
+    """Upsert list of {id, values, metadata} in batches of 100."""
+    index = _get_index()
+    BATCH = 100
+    for i in range(0, len(vectors), BATCH):
+        index.upsert(vectors=vectors[i:i+BATCH])
+    print(f"[PineconeService] Upserted {len(vectors)} vectors")
+
+
 def query_pinecone(
     query_vector: list[float],
     top_k: int = 8,
-    score_threshold: float = 0.5,
-    return_top: int = 3,
+    score_threshold: float = 0.35,
+    return_top: int = 5,
 ) -> list[dict]:
     """
-    Query Pinecone and return filtered, ranked chunks.
-
-    Returns:
-        List of dicts: {text, source, chunk_index, score}
+    Query Pinecone, filter by threshold, return top results.
+    Threshold 0.35 is appropriate for gemini-embedding-001 cosine scores.
     """
     try:
         index  = _get_index()
@@ -53,31 +80,27 @@ def query_pinecone(
             include_metadata=True,
         )
 
-        # FIXED: Pinecone v3 returns QueryResponse object
-        # result.matches is a list of ScoredVector objects (NOT a dict)
-        raw_matches = result.matches  # ← was: result.get("matches", [])
+        raw_matches = result.matches  # Pinecone v3: object not dict
 
-        filtered = []
+        chunks = []
         for m in raw_matches:
-            # FIXED: attribute access, not dict key access
             score    = float(getattr(m, "score", 0))
             metadata = getattr(m, "metadata", {}) or {}
 
             if score < score_threshold:
                 continue
 
-            filtered.append({
-                "text":        metadata.get("text", ""),
-                "source":      metadata.get("source", "unknown"),
+            chunks.append({
+                "text":        metadata.get("text",        ""),
+                "source":      metadata.get("source",      "unknown"),
                 "chunk_index": int(metadata.get("chunkIndex", 0)),
                 "score":       round(score, 4),
             })
 
-        # Sort descending by score
-        filtered.sort(key=lambda x: x["score"], reverse=True)
-        results = filtered[:return_top]
+        chunks.sort(key=lambda x: x["score"], reverse=True)
+        results = chunks[:return_top]
 
-        print(f"[PineconeService] {len(results)} chunks above threshold={score_threshold}")
+        print(f"[PineconeService] {len(results)}/{len(raw_matches)} chunks above threshold={score_threshold}")
         return results
 
     except RuntimeError:
@@ -85,3 +108,12 @@ def query_pinecone(
     except Exception as exc:
         print(f"[PineconeService] query failed: {exc}")
         return []
+
+
+def delete_by_source(source: str) -> None:
+    try:
+        index = _get_index()
+        index.delete(filter={"source": {"$eq": source}})
+        print(f"[PineconeService] Deleted vectors for source: {source}")
+    except Exception as exc:
+        print(f"[PineconeService] delete_by_source error: {exc}")
