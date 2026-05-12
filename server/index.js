@@ -11,31 +11,14 @@ import logsRouter    from "./routes/logs.js";
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-// ── CORS — must list every origin that will call this server ──
-const allowedOrigins = [
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-  process.env.CLIENT_URL,          // Vercel URL set in Render env vars
-].filter(Boolean);
+
 
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (curl, Postman, server-to-server)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    console.warn(`[CORS] Blocked origin: ${origin}`);
-    callback(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Session-ID"],
+  origin: true,
   credentials: true,
 }));
 
-// Must be BEFORE routes — handles pre-flight OPTIONS for every route
-app.options("*", cors({
-  origin: allowedOrigins,
-  credentials: true,
-}));
+app.options("*", cors());
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
