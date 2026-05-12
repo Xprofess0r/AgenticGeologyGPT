@@ -25,7 +25,7 @@ from services.web_search_service import search_web
 from graph_state import AgentState
 
 # Raised from 0.55 → 0.70: only skip web search if RAG is VERY confident
-RAG_SKIP_SCORE = 0.70
+RAG_SKIP_SCORE = 0.80
 RAG_SKIP_COUNT = 3   # need 3 chunks ALL above 0.70 to skip web search
 
 

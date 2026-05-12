@@ -31,7 +31,7 @@ def retriever_node(state: AgentState) -> AgentState:
         chunks = query_pinecone(
             query_vector    = query_embedding,
             top_k           = 10,
-            score_threshold = 0.35,  # gemini-embedding-001 appropriate threshold
+            score_threshold = 0.55,  # gemini-embedding-001 appropriate threshold
             return_top      = 5,
         )
 
