@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: geologygpt-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: geologygpt
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: PYTHON_AGENT_URL
+        sync: false
+      - key: CLIENT_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: ENABLE_NODEJS_FALLBACK
+        value: "true"

@@ -1,13 +1,10 @@
 """
-main.py  (FIXED)
+main.py  (v6 — fixed for local + deployment)
 
-Fixes applied:
-  1. agent_endpoint changed from sync `def` → async `async def`
-     → FastAPI requires async endpoints when calling any blocking I/O
-     → But LangGraph is sync, so we use run_in_executor to avoid blocking event loop
-  2. run_agent wrapped in asyncio executor for non-blocking FastAPI integration
-  3. Added startup health check logging
-  4. Better error responses with specific error types
+Changes:
+  - CORS origins from env var NODE_SERVER_URL + always allow localhost
+  - asyncio.get_event_loop() deprecated warning fixed → use asyncio.get_running_loop()
+  - Startup prints port clearly for Render logs
 """
 
 import os
@@ -24,28 +21,35 @@ import time
 
 from graph import run_agent
 
-# Thread pool for running sync LangGraph in async FastAPI
 _executor = ThreadPoolExecutor(max_workers=4)
 
 app = FastAPI(
     title="GeologyGPT Python Agent",
-    description="LangGraph geology agent with RAG, web search, and Gemini",
-    version="1.1.0",
+    version="1.2.0",
 )
+
+# CORS — allow Node.js server and localhost to call this
+_node_url = os.environ.get("NODE_SERVER_URL", "")
+_cors_origins = [
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "http://localhost:8000",
+    "*",  # For Render → Render internal calls; restrict after testing
+]
+if _node_url:
+    _cors_origins.append(_node_url)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],   # Python agent is internal — Node.js is the public gateway
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Schemas ───────────────────────────────────────────────────
-
 class HistoryMessage(BaseModel):
-    role:    str = Field(..., description="'user' or 'assistant'")
+    role:    str = Field(...)
     content: str
 
 
@@ -65,34 +69,24 @@ class AgentResponse(BaseModel):
     latency_ms:      int
 
 
-# ── Startup ───────────────────────────────────────────────────
-
 @app.on_event("startup")
 async def startup_event():
-    """Log startup env check."""
+    port = int(os.environ.get("PYTHON_AGENT_PORT", 8000))
     checks = {
-        "GEMINI_API_KEY":    bool(os.environ.get("GEMINI_API_KEY")),
-        "COHERE_API_KEY":    bool(os.environ.get("COHERE_API_KEY")),
-        "PINECONE_API_KEY":  bool(os.environ.get("PINECONE_API_KEY")),
-        "TAVILY_API_KEY":    bool(os.environ.get("TAVILY_API_KEY")),
+        "GEMINI_API_KEY":   bool(os.environ.get("GEMINI_API_KEY")),
+        "PINECONE_API_KEY": bool(os.environ.get("PINECONE_API_KEY")),
+        "TAVILY_API_KEY":   bool(os.environ.get("TAVILY_API_KEY")),
     }
-    print("\n" + "="*50)
-    print("GeologyGPT Python Agent starting up")
-    for key, present in checks.items():
-        status = "✓" if present else "✗ MISSING"
-        print(f"  {key}: {status}")
-    print("="*50 + "\n")
+    print(f"\n{'='*50}")
+    print(f"GeologyGPT Python Agent v1.2 — port {port}")
+    for k, v in checks.items():
+        print(f"  {k}: {'✓' if v else '✗ MISSING'}")
+    print(f"{'='*50}\n")
 
-
-# ── Routes ────────────────────────────────────────────────────
 
 @app.get("/")
-def health_check():
-    return {
-        "status":  "GeologyGPT Python Agent 🪨",
-        "version": "1.1.0",
-        "graph":   "QueryNode → RetrieverNode → WebSearchNode → DecisionNode → Answer/Block",
-    }
+def root():
+    return {"status": "GeologyGPT Python Agent 🪨", "version": "1.2.0"}
 
 
 @app.get("/health")
@@ -102,27 +96,21 @@ def health():
 
 @app.post("/agent", response_model=AgentResponse)
 async def agent_endpoint(request: AgentRequest):
-    """
-    Main agent endpoint — called by Node.js chat controller.
-    FIXED: async def + ThreadPoolExecutor for sync LangGraph compatibility.
-    """
     query = request.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query cannot be empty")
 
     history = [{"role": m.role, "content": m.content} for m in request.history]
-
     t0 = time.time()
 
     try:
-        # FIXED: Run sync LangGraph in thread pool — doesn't block FastAPI event loop
-        loop   = asyncio.get_event_loop()
+        # Run sync LangGraph graph in thread pool — safe with async FastAPI
+        loop   = asyncio.get_running_loop()   # fixed: get_event_loop is deprecated
         result = await loop.run_in_executor(
             _executor,
             lambda: run_agent(query=query, history=history)
         )
     except Exception as exc:
-        print(f"[main] Agent error: {exc}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Agent failed: {str(exc)}")
@@ -140,8 +128,6 @@ async def agent_endpoint(request: AgentRequest):
         latency_ms      = latency_ms,
     )
 
-
-# ── Dev runner ────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

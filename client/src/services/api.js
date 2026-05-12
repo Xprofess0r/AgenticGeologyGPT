@@ -1,6 +1,13 @@
+/**
+ * api.js
+ *
+ * REACT_APP_API_URL must be set for production (Vercel).
+ * In development, falls back to http://localhost:5000.
+ * The "proxy" in package.json only works with react-scripts start (dev mode).
+ */
+
 const BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";
 
-// Stable session ID per browser tab
 let _sessionId = null;
 export function getSessionId() {
   if (!_sessionId) {
@@ -9,10 +16,6 @@ export function getSessionId() {
   return _sessionId;
 }
 
-/**
- * Send chat messages through the agentic pipeline.
- * Returns: { reply, sources, confidence, route, evaluation, steps, runId }
- */
 export async function sendChatMessage(messages) {
   const res = await fetch(`${BASE}/api/chat`, {
     method:  "POST",
@@ -26,17 +29,15 @@ export async function sendChatMessage(messages) {
   return res.json();
 }
 
-/** Clear server-side session memory */
 export async function resetSession() {
   await fetch(`${BASE}/api/chat/session/reset`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId: getSessionId() }),
-  });
-  _sessionId = null; // reset client session too
+  }).catch(() => {});
+  _sessionId = null;
 }
 
-/** Notes explainer */
 export async function explainNotes(text) {
   const res = await fetch(`${BASE}/api/explain`, {
     method:  "POST",
@@ -47,11 +48,9 @@ export async function explainNotes(text) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `Server error ${res.status}`);
   }
-  const data = await res.json();
-  return data.explanation;
+  return (await res.json()).explanation;
 }
 
-/** Upload PDF with progress */
 export async function uploadPDF(file, onProgress) {
   const formData = new FormData();
   formData.append("pdf", file);
@@ -59,13 +58,11 @@ export async function uploadPDF(file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${BASE}/api/upload`);
-
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) {
         onProgress(Math.round((e.loaded / e.total) * 100));
       }
     };
-
     xhr.onload = () => {
       try {
         const data = JSON.parse(xhr.responseText);
@@ -75,13 +72,11 @@ export async function uploadPDF(file, onProgress) {
         reject(new Error("Invalid server response"));
       }
     };
-
     xhr.onerror = () => reject(new Error("Network error — is the server running?"));
     xhr.send(formData);
   });
 }
 
-/** Fetch recent agent run logs */
 export async function fetchLogs(n = 20) {
   const res = await fetch(`${BASE}/api/logs?n=${n}`);
   if (!res.ok) throw new Error("Failed to fetch logs");

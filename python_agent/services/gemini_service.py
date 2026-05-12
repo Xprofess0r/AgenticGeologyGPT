@@ -1,11 +1,10 @@
 """
-services/gemini_service.py  (v5)
+services/gemini_service.py  (v6 — FIXED)
 
-Changes:
-  - Model updated to gemini-2.5-flash (matches SpaceGPT)
-  - Rate limiter: 2s min interval (safe for 15 RPM free tier)
-  - DR_TERRA_SYSTEM: geology-focused but NOT blocking — allows natural answers
-  - generate_answer: single clean Gemini call per request
+Key fix in generate_answer():
+  The prompt now EXPLICITLY instructs Gemini to use web results even when
+  RAG notes don't cover the topic. Previously Gemini would say
+  "not found in your notes" and stop — ignoring web results entirely.
 """
 
 import os
@@ -16,21 +15,28 @@ MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 _last_call_time: float = 0.0
-_MIN_CALL_INTERVAL     = 2.0  # 2s = safe for 15 RPM free tier
+_MIN_CALL_INTERVAL     = 2.0
 
 DR_TERRA_SYSTEM = """You are Dr. Terra, an expert geology professor and field geologist with 25 years of experience.
 
-You specialize in: petrology, mineralogy, structural geology, tectonics, stratigraphy, sedimentology, geomorphology, geophysics, hydrogeology, paleontology, geochemistry, volcanology, seismology, field mapping, rock/mineral identification, GIS for geology, borehole analysis, seismic interpretation.
+You specialize in: petrology, mineralogy, structural geology, tectonics, stratigraphy, sedimentology,
+geomorphology, geophysics, hydrogeology, paleontology, geochemistry, volcanology, seismology,
+field mapping, rock/mineral identification, GIS for geology, borehole analysis, seismic interpretation,
+remote sensing for geology, mineral exploration, geohazards.
 
-ANSWER RULES:
-- When CONTEXT sections are provided, base your answer primarily on that context
-- Cite [Source N] for document context, [Web N] for web search results inline
-- NEVER fabricate mineral properties, rock names, measurements, or citations
-- When uncertain, say so explicitly
-- Use markdown headers for structured answers
-- Define technical jargon on first use
-- Be enthusiastic and encouraging for students
-- Add practical fieldwork tips where relevant"""
+ANSWER PRIORITY (follow this order):
+1. If WEB SEARCH RESULTS are provided → use them as primary source for answering
+2. If UPLOADED DOCUMENT CONTEXT is provided and relevant → cite it with [Source N]
+3. If neither covers the topic → answer from your own geology expertise
+
+CRITICAL RULES:
+- NEVER say "not found in notes" and stop. Always give a complete answer.
+- If notes don't cover the topic but web results do → answer from web results, cite [Web N]
+- If neither notes nor web cover it → answer from your 25 years of geology expertise
+- NEVER refuse to answer a geology question just because uploaded notes don't mention it
+- Cite [Source N] for document chunks, [Web N] for web results, inline
+- Use markdown headers for multi-part answers
+- Define technical terms on first use"""
 
 
 def _rate_limit():
@@ -38,7 +44,7 @@ def _rate_limit():
     elapsed = time.time() - _last_call_time
     if elapsed < _MIN_CALL_INTERVAL:
         wait = _MIN_CALL_INTERVAL - elapsed
-        print(f"[GeminiService] Rate limit pause {wait:.1f}s")
+        print(f"[GeminiService] Rate limit — waiting {wait:.1f}s")
         time.sleep(wait)
     _last_call_time = time.time()
 
@@ -53,38 +59,50 @@ def generate_answer(
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
 
-    # ── Build context block (SpaceGPT critique_node equivalent) ──
+    # ── Build context sections ────────────────────────────────
     context_block = ""
+
+    if web_results:
+        web_text = "\n\n---\n\n".join(
+            f"[Web {i+1} — {r['title']}]\nURL: {r['url']}\n{r['snippet']}"
+            for i, r in enumerate(web_results)
+        )
+        # Web results come FIRST — they are often more relevant than uploaded notes
+        context_block += f"\n=== WEB SEARCH RESULTS (use these to answer) ===\n{web_text}\n=== END WEB ===\n"
 
     if rag_results:
         chunks_text = "\n\n---\n\n".join(
             f"[Source {i+1} — {c['source'].replace('_',' ')}, "
-            f"{round(c.get('score',0)*100)}% relevant]\n{c['text']}"
+            f"{round(c.get('score',0)*100)}% match]\n{c['text']}"
             for i, c in enumerate(rag_results)
         )
-        context_block += f"\n=== UPLOADED DOCUMENT CONTEXT ===\n{chunks_text}\n=== END ===\n"
+        context_block += f"\n=== UPLOADED NOTES CONTEXT ===\n{chunks_text}\n=== END NOTES ===\n"
 
-    if web_results:
-        web_text = "\n\n---\n\n".join(
-            f"[Web {i+1} — {r['title']}]\n{r['url']}\n{r['snippet']}"
-            for i, r in enumerate(web_results)
+    # ── Explicit instruction based on what context we have ────
+    if web_results and rag_results:
+        instruction = (
+            "Web search results AND uploaded notes are provided above.\n"
+            "Answer primarily from the web results. Supplement with notes if relevant.\n"
+            "Cite [Web N] and [Source N] inline."
         )
-        context_block += f"\n=== WEB SEARCH RESULTS ===\n{web_text}\n=== END ===\n"
-
-    # ── Accuracy instruction (SpaceGPT writer_node equivalent) ──
-    if context_block:
-        accuracy = (
-            "Use the CONTEXT above to answer. "
-            "Cite [Source N] or [Web N] inline for specific facts. "
-            "Do NOT fabricate data not in the context."
+    elif web_results:
+        instruction = (
+            "Web search results are provided above. Use them to give a complete answer.\n"
+            "Cite [Web N] inline for specific facts."
+        )
+    elif rag_results:
+        instruction = (
+            "Uploaded notes are provided above. Use them if relevant.\n"
+            "If the notes don't cover this specific topic, answer from your geology expertise.\n"
+            "Do NOT say 'not found in notes' — always provide a complete answer."
         )
     else:
-        accuracy = (
-            "No external context available. Answer from your geology expertise. "
-            "Be precise — do not fabricate data or measurements."
+        instruction = (
+            "No external context available. Answer from your 25 years of geology expertise.\n"
+            "Be thorough and accurate."
         )
 
-    # ── Conversation history (last 6 turns) ───────────────────
+    # ── Conversation history ───────────────────────────────────
     history_text = ""
     if history:
         history_text = "\n\n".join(
@@ -94,9 +112,10 @@ def generate_answer(
 
     prompt = (
         f"{context_block}\n"
-        f"{accuracy}\n\n"
+        f"{instruction}\n\n"
         f"{history_text}\n\n"
-        f"Student: {query}"
+        f"Student: {query}\n"
+        f"Dr. Terra:"
     ).strip()
 
     url = f"{BASE_URL}/{MODEL}:generateContent?key={api_key}"
@@ -132,6 +151,7 @@ def generate_answer(
             resp.raise_for_status()
             data       = resp.json()
             candidates = data.get("candidates", [])
+
             if not candidates:
                 raise ValueError("No candidates in Gemini response")
 
@@ -145,7 +165,7 @@ def generate_answer(
 
             if not text:
                 if finish_reason == "SAFETY":
-                    return "⚠️ Response blocked by Gemini safety filters. Please rephrase your geology question."
+                    return "⚠️ Response blocked by safety filters. Please rephrase your geology question."
                 raise ValueError(f"Empty Gemini response (finishReason={finish_reason})")
 
             print(f"[GeminiService] Success — {len(text)} chars [{elapsed}ms]")
