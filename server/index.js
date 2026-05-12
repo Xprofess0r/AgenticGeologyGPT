@@ -32,7 +32,10 @@ app.use(cors({
 }));
 
 // Must be BEFORE routes — handles pre-flight OPTIONS for every route
-app.options("*", cors());
+app.options("*", cors({
+  origin: allowedOrigins,
+  credentials: true,
+}));
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
