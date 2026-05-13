@@ -2,41 +2,62 @@ import React, { useState, useCallback } from "react";
 import Sidebar from "./components/Sidebar";
 import ChatPage from "./pages/ChatPage";
 import ExplainPage from "./pages/ExplainPage";
-import GISPage from "./pages/GISPage";
-import DashboardPage from "./pages/DashboardPage";
 import UploadPage from "./pages/UploadPage";
 import LogsPage from "./pages/LogsPage";
 
 export default function App() {
-  const [activeView, setActiveView] = useState("chat");
-  const [quickTopic, setQuickTopic] = useState(null);
+  const [activeView, setActiveView]   = useState("chat");
+  const [quickTopic, setQuickTopic]   = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const handleQuickTopic = useCallback((topic) => {
     setActiveView("chat");
     setQuickTopic(topic);
+    setSidebarOpen(false);
+  }, []);
+
+  const handleViewChange = useCallback((view) => {
+    setActiveView(view);
+    setSidebarOpen(false);
   }, []);
 
   const renderPage = () => {
     switch (activeView) {
-      case "chat":      return <ChatPage initialPrompt={quickTopic} onPromptConsumed={() => setQuickTopic(null)} />;
-      case "explain":   return <ExplainPage />;
-      case "upload":    return <UploadPage />;
-      case "logs":      return <LogsPage />;
-      case "gis":       return <GISPage />;
-      case "dashboard": return <DashboardPage />;
-      default:          return <ChatPage />;
+      case "chat":    return <ChatPage initialPrompt={quickTopic} onPromptConsumed={() => setQuickTopic(null)} />;
+      case "explain": return <ExplainPage />;
+      case "upload":  return <UploadPage />;
+      case "logs":    return <LogsPage />;
+      default:        return <ChatPage />;
     }
   };
 
   return (
-    <div style={styles.root}>
-      <Sidebar activeView={activeView} onViewChange={setActiveView} onQuickTopic={handleQuickTopic} />
-      <main style={styles.main}>{renderPage()}</main>
+    <div className="app-root">
+      {/* Mobile overlay */}
+      {sidebarOpen && (
+        <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} />
+      )}
+
+      <Sidebar
+        activeView={activeView}
+        onViewChange={handleViewChange}
+        onQuickTopic={handleQuickTopic}
+        isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      <div className="app-main">
+        {/* Mobile top bar */}
+        <div className="mobile-topbar">
+          <button className="hamburger" onClick={() => setSidebarOpen(true)} aria-label="Open menu">
+            <span /><span /><span />
+          </button>
+          <span className="mobile-title">GeologyGPT</span>
+          <span className="mobile-badge">v3</span>
+        </div>
+
+        <main className="main-content">{renderPage()}</main>
+      </div>
     </div>
   );
 }
-
-const styles = {
-  root: { display: "flex", height: "100vh", overflow: "hidden", background: "var(--bg-base)" },
-  main: { flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" },
-};

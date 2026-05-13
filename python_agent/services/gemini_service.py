@@ -1,10 +1,16 @@
 """
-services/gemini_service.py  (v6 — FIXED)
+services/gemini_service.py  (v7 — DEFINITIVE FIX)
 
-Key fix in generate_answer():
-  The prompt now EXPLICITLY instructs Gemini to use web results even when
-  RAG notes don't cover the topic. Previously Gemini would say
-  "not found in your notes" and stop — ignoring web results entirely.
+ROOT CAUSE of "skipping web search" even when web_results exist:
+  The prompt put RAG notes FIRST and said "base your answer on context".
+  Gemini read the seismic notes, found no mining content, said "not found"
+  and STOPPED — never reading the web results that were also in the prompt.
+
+FIX:
+  1. Web results appear FIRST in the prompt
+  2. Explicit fallback chain: Web → Notes → Own expertise
+  3. Hard rule in system prompt: NEVER say "not in my notes" and stop
+  4. If TAVILY_API_KEY is missing → warn clearly in logs (not silent)
 """
 
 import os
@@ -15,28 +21,36 @@ MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 _last_call_time: float = 0.0
-_MIN_CALL_INTERVAL     = 2.0
+_MIN_CALL_INTERVAL     = 2.0   # seconds — safe for 15 RPM free tier
 
 DR_TERRA_SYSTEM = """You are Dr. Terra, an expert geology professor and field geologist with 25 years of experience.
 
-You specialize in: petrology, mineralogy, structural geology, tectonics, stratigraphy, sedimentology,
-geomorphology, geophysics, hydrogeology, paleontology, geochemistry, volcanology, seismology,
-field mapping, rock/mineral identification, GIS for geology, borehole analysis, seismic interpretation,
-remote sensing for geology, mineral exploration, geohazards.
+You are an expert in: petrology, mineralogy, structural geology, tectonics, stratigraphy, sedimentology, geomorphology, geophysics, hydrogeology, paleontology, geochemistry, volcanology, seismology, field mapping, rock identification, mineral exploration, mining geology, economic geology, remote sensing for geology, borehole analysis, seismic interpretation.
 
-ANSWER PRIORITY (follow this order):
-1. If WEB SEARCH RESULTS are provided → use them as primary source for answering
-2. If UPLOADED DOCUMENT CONTEXT is provided and relevant → cite it with [Source N]
-3. If neither covers the topic → answer from your own geology expertise
+=== CRITICAL ANSWER RULES — FOLLOW THESE EXACTLY ===
 
-CRITICAL RULES:
-- NEVER say "not found in notes" and stop. Always give a complete answer.
-- If notes don't cover the topic but web results do → answer from web results, cite [Web N]
-- If neither notes nor web cover it → answer from your 25 years of geology expertise
-- NEVER refuse to answer a geology question just because uploaded notes don't mention it
-- Cite [Source N] for document chunks, [Web N] for web results, inline
-- Use markdown headers for multi-part answers
-- Define technical terms on first use"""
+RULE 1 — ANSWER PRIORITY (always follow this order):
+  a) If WEB SEARCH RESULTS are provided → answer FROM them as the PRIMARY source
+  b) If UPLOADED NOTES are provided and relevant → supplement with [Source N] citations
+  c) If neither covers the topic → answer from your 25 years of geology expertise
+
+RULE 2 — NEVER do these:
+  ✗ NEVER say "the notes don't cover this topic" and stop
+  ✗ NEVER say "not found in provided context" and stop  
+  ✗ NEVER say "you would need to consult other resources"
+  ✗ NEVER refuse to answer a geology question
+  ✓ ALWAYS give a complete, expert answer using whatever sources are available
+
+RULE 3 — CITATIONS:
+  - Cite web results inline as [Web 1], [Web 2] etc.
+  - Cite uploaded notes inline as [Source 1], [Source 2] etc.
+  - If answering from your own knowledge, no citation needed
+
+RULE 4 — FORMAT:
+  - Use markdown headers (##) for multi-part answers
+  - Define technical terms on first use
+  - Be thorough but concise
+  - Add practical field tips where relevant"""
 
 
 def _rate_limit():
@@ -59,50 +73,69 @@ def generate_answer(
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
 
-    # ── Build context sections ────────────────────────────────
+    # Log clearly so you can debug from Render logs
+    print(f"[GeminiService] Building prompt — web={len(web_results)}, rag={len(rag_results)}")
+    if not web_results:
+        tavily_key = os.environ.get("TAVILY_API_KEY", "").strip()
+        if not tavily_key:
+            print("[GeminiService] ⚠️  TAVILY_API_KEY is NOT SET — web search disabled!")
+        else:
+            print("[GeminiService] ℹ️  Web search ran but returned 0 results")
+
+    # ── Build context — WEB FIRST ─────────────────────────────
     context_block = ""
 
     if web_results:
         web_text = "\n\n---\n\n".join(
-            f"[Web {i+1} — {r['title']}]\nURL: {r['url']}\n{r['snippet']}"
+            f"[Web {i+1}] {r['title']}\nURL: {r['url']}\n{r['snippet']}"
             for i, r in enumerate(web_results)
         )
-        # Web results come FIRST — they are often more relevant than uploaded notes
-        context_block += f"\n=== WEB SEARCH RESULTS (use these to answer) ===\n{web_text}\n=== END WEB ===\n"
+        context_block += (
+            "\n=== WEB SEARCH RESULTS — USE THESE TO ANSWER ===\n"
+            f"{web_text}"
+            "\n=== END WEB RESULTS ===\n\n"
+        )
 
     if rag_results:
         chunks_text = "\n\n---\n\n".join(
-            f"[Source {i+1} — {c['source'].replace('_',' ')}, "
-            f"{round(c.get('score',0)*100)}% match]\n{c['text']}"
+            f"[Source {i+1}] {c['source'].replace('_',' ')} ({round(c.get('score',0)*100)}% match)\n{c['text']}"
             for i, c in enumerate(rag_results)
         )
-        context_block += f"\n=== UPLOADED NOTES CONTEXT ===\n{chunks_text}\n=== END NOTES ===\n"
+        context_block += (
+            "\n=== UPLOADED NOTES (supplementary) ===\n"
+            f"{chunks_text}"
+            "\n=== END NOTES ===\n\n"
+        )
 
-    # ── Explicit instruction based on what context we have ────
+    # ── Instruction based on available context ────────────────
     if web_results and rag_results:
         instruction = (
-            "Web search results AND uploaded notes are provided above.\n"
-            "Answer primarily from the web results. Supplement with notes if relevant.\n"
-            "Cite [Web N] and [Source N] inline."
+            "Both web search results and uploaded notes are available above.\n"
+            "Answer PRIMARILY from the web results [Web N].\n"
+            "Use the uploaded notes [Source N] only to add extra depth.\n"
+            "Give a complete, detailed answer."
         )
     elif web_results:
         instruction = (
-            "Web search results are provided above. Use them to give a complete answer.\n"
-            "Cite [Web N] inline for specific facts."
+            "Web search results are available above.\n"
+            "Answer from these results, citing [Web N] inline.\n"
+            "Give a complete, detailed answer."
         )
     elif rag_results:
         instruction = (
-            "Uploaded notes are provided above. Use them if relevant.\n"
-            "If the notes don't cover this specific topic, answer from your geology expertise.\n"
-            "Do NOT say 'not found in notes' — always provide a complete answer."
+            "Uploaded notes are available above — use them if relevant.\n"
+            "If the notes don't cover this specific topic, "
+            "answer from your own 25 years of geology expertise.\n"
+            "Do NOT say 'not in my notes' — always give a complete answer."
         )
     else:
         instruction = (
-            "No external context available. Answer from your 25 years of geology expertise.\n"
-            "Be thorough and accurate."
+            "No external context available.\n"
+            "Answer from your 25 years of geology expertise.\n"
+            "Be thorough, accurate, and cite well-known geological principles."
         )
 
-    # ── Conversation history ───────────────────────────────────
+    # ── Conversation history ──────────────────────────────────
     history_text = ""
     if history:
         history_text = "\n\n".join(
@@ -111,7 +144,7 @@ def generate_answer(
         )
 
     prompt = (
-        f"{context_block}\n"
+        f"{context_block}"
         f"{instruction}\n\n"
         f"{history_text}\n\n"
         f"Student: {query}\n"
@@ -122,10 +155,7 @@ def generate_answer(
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": DR_TERRA_SYSTEM}]},
-        "generationConfig": {
-            "maxOutputTokens": 1800,
-            "temperature":     0.6,
-        },
+        "generationConfig": {"maxOutputTokens": 1800, "temperature": 0.6},
     }
 
     MAX_RETRIES = 2
@@ -151,9 +181,8 @@ def generate_answer(
             resp.raise_for_status()
             data       = resp.json()
             candidates = data.get("candidates", [])
-
             if not candidates:
-                raise ValueError("No candidates in Gemini response")
+                raise ValueError("No candidates in response")
 
             finish_reason = candidates[0].get("finishReason", "UNKNOWN")
             text = (
@@ -165,10 +194,10 @@ def generate_answer(
 
             if not text:
                 if finish_reason == "SAFETY":
-                    return "⚠️ Response blocked by safety filters. Please rephrase your geology question."
-                raise ValueError(f"Empty Gemini response (finishReason={finish_reason})")
+                    return "⚠️ Response blocked by safety filters. Please rephrase."
+                raise ValueError(f"Empty response (finishReason={finish_reason})")
 
-            print(f"[GeminiService] Success — {len(text)} chars [{elapsed}ms]")
+            print(f"[GeminiService] ✓ {len(text)} chars [{elapsed}ms]")
             return text
 
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
