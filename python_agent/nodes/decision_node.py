@@ -1,61 +1,46 @@
 """
-nodes/decision_node.py  (v5 — SpaceGPT-aligned)
+nodes/decision_node.py  (v8 — FINAL)
 
-SpaceGPT uses should_continue() which reads is_out_of_scope from plan_node.
-We trust QueryNode's Gemini planner verdict. The decision node just forwards it.
+ROOT CAUSE FIXED:
+  Old logic: "PASS (override) if RAG score > 0.30"
+  Problem: Seismic notes score 0.30-0.34 on ANY geology-adjacent query.
+           Compiler design got 0.34 from seismic notes → PASS override → answered!
 
-If QueryNode's Gemini call failed and fell back to keywords:
-  - We also check RAG evidence and web results as secondary signals
-  - This ensures robustness even when the planner call fails
+FIX:
+  DecisionNode now TRUSTS QueryNode completely.
+  QueryNode is the sole geology gate (keyword + blocklist).
+  DecisionNode just forwards the verdict — no override logic.
 
-BLOCK only if ALL of these fail:
-  1. QueryNode said is_geology=False
-  2. No RAG evidence (score < 0.30)
-  3. No geology-relevant web results
+  The only purpose of DecisionNode is to provide a clean routing point
+  for LangGraph's conditional edges.
 """
 
 import time
-from services.web_search_service import is_geology_relevant
 from graph_state import AgentState
 
 
 def decision_node(state: AgentState) -> AgentState:
-    is_geology  = state.get("is_geology",       False)
-    rag_results = state.get("rag_results",       [])
-    web_results = state.get("web_results",       [])
-    emb_score   = state.get("embedding_score",   0.0)
-
+    is_geology      = state.get("is_geology", False)
+    rag_results     = state.get("rag_results", [])
+    web_results     = state.get("web_results", [])
+    decision_reason = state.get("_decision_reason", "")
     t0 = time.time()
 
-    # If planner already confirmed geology — trust it
-    if is_geology:
-        top_rag = max((r.get("score", 0) for r in rag_results), default=0)
-        reason  = f"PASS — planner confirmed geology (emb={emb_score:.2f}, rag_top={top_rag:.3f})"
-        elapsed = round((time.time() - t0) * 1000)
-        print(f"[DecisionNode] {reason} [{elapsed}ms]")
-        return {**state, "is_geology": True, "_decision_reason": reason}
-
-    # Planner said NOT geology — check secondary evidence before blocking
-    rag_has_evidence = any(r.get("score", 0) >= 0.30 for r in rag_results)
-    web_has_geology  = is_geology_relevant(web_results)
-
-    # Override if evidence found
-    if rag_has_evidence or web_has_geology:
-        signals = []
-        if rag_has_evidence:
-            top = max((r["score"] for r in rag_results), default=0)
-            signals.append(f"RAG_evidence(top={top:.3f})")
-        if web_has_geology:
-            signals.append(f"web_geology_detected")
-        reason  = "PASS (override) — " + ", ".join(signals)
-        elapsed = round((time.time() - t0) * 1000)
-        print(f"[DecisionNode] {reason} [{elapsed}ms]")
-        return {**state, "is_geology": True, "_decision_reason": reason}
-
-    reason  = f"BLOCK — planner: not geology, no RAG evidence, no geo web results"
+    top_rag = max((r.get("score", 0) for r in rag_results), default=0)
     elapsed = round((time.time() - t0) * 1000)
-    print(f"[DecisionNode] {reason} [{elapsed}ms]")
-    return {**state, "is_geology": False, "_decision_reason": reason}
+
+    if is_geology:
+        reason = (
+            f"PASS — geology confirmed by QueryNode "
+            f"(rag={len(rag_results)} chunks, top={top_rag:.3f}, "
+            f"web={len(web_results)} results)"
+        )
+        print(f"[DecisionNode] {reason} [{elapsed}ms]")
+        return {**state, "_decision_reason": reason}
+    else:
+        reason = "BLOCK — QueryNode rejected as non-geology"
+        print(f"[DecisionNode] {reason} [{elapsed}ms]")
+        return {**state, "_decision_reason": reason}
 
 
 def route_after_decision(state: AgentState) -> str:
